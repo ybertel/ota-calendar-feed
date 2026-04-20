@@ -1,0 +1,154 @@
+name: Build OTA ICS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build combined ICS
+        env:
+          BOOKING_303: ${{ secrets.BOOKING_303 }}
+          BOOKING_305: ${{ secrets.BOOKING_305 }}
+          BOOKING_301: ${{ secrets.BOOKING_301 }}
+          BOOKING_205: ${{ secrets.BOOKING_205 }}
+          BOOKING_203: ${{ secrets.BOOKING_203 }}
+          BOOKING_201: ${{ secrets.BOOKING_201 }}
+          BOOKING_302: ${{ secrets.BOOKING_302 }}
+          BOOKING_206: ${{ secrets.BOOKING_206 }}
+          BOOKING_307: ${{ secrets.BOOKING_307 }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import urllib.request
+          from datetime import datetime
+          from pathlib import Path
+
+          ROOM_URLS = {
+              "303": os.environ.get("BOOKING_303", "").strip(),
+              "305": os.environ.get("BOOKING_305", "").strip(),
+              "301": os.environ.get("BOOKING_301", "").strip(),
+              "205": os.environ.get("BOOKING_205", "").strip(),
+              "203": os.environ.get("BOOKING_203", "").strip(),
+              "201": os.environ.get("BOOKING_201", "").strip(),
+              "302": os.environ.get("BOOKING_302", "").strip(),
+              "206": os.environ.get("BOOKING_206", "").strip(),
+              "307": os.environ.get("BOOKING_307", "").strip(),
+          }
+
+          def fetch_text(url: str) -> str:
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0",
+                      "Accept": "text/calendar,text/plain,*/*",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return resp.read().decode("utf-8", errors="replace")
+
+          def parse_ics_events(text: str):
+              text = text.replace("\r\n", "\n").replace("\r", "\n")
+              raw_events = re.findall(r"BEGIN:VEVENT(.*?)END:VEVENT", text, flags=re.S)
+              events = []
+              for raw in raw_events:
+                  m_start = re.search(r"DTSTART(?:;VALUE=DATE)?:(\d{8})", raw)
+                  m_end = re.search(r"DTEND(?:;VALUE=DATE)?:(\d{8})", raw)
+                  if not m_start or not m_end:
+                      continue
+                  start = datetime.strptime(m_start.group(1), "%Y%m%d").date()
+                  end = datetime.strptime(m_end.group(1), "%Y%m%d").date()
+                  if end > start:
+                      events.append((start, end))
+              return sorted(events)
+
+          def merge_ranges(ranges):
+              if not ranges:
+                  return []
+              merged = [list(ranges[0])]
+              for start, end in ranges[1:]:
+                  last_start, last_end = merged[-1]
+                  if start <= last_end:
+                      if end > last_end:
+                          merged[-1][1] = end
+                  else:
+                      merged.append([start, end])
+              return [(s, e) for s, e in merged]
+
+          def fmt_md(d):
+              return f"{d.month}/{d.day}"
+
+          all_events = []
+          for room, url in ROOM_URLS.items():
+              if not url:
+                  continue
+              text = fetch_text(url)
+              ranges = parse_ics_events(text)
+              merged = merge_ranges(ranges)
+              for checkin, checkout in merged:
+                  summary = f"B {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
+                  all_events.append({
+                      "room": room,
+                      "checkin": checkin,
+                      "checkout": checkout,
+                      "summary": summary,
+                  })
+
+          all_events.sort(key=lambda x: (x["checkin"], x["room"]))
+
+          now_utc = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+          lines = [
+              "BEGIN:VCALENDAR",
+              "VERSION:2.0",
+              "PRODID:-//ybertel//OTA Combined Calendar//EN",
+              "CALSCALE:GREGORIAN",
+              "METHOD:PUBLISH",
+              "X-WR-CALNAME:OTA Combined",
+              "X-WR-TIMEZONE:Asia/Seoul",
+          ]
+
+          for ev in all_events:
+              dtstart = ev["checkin"].strftime("%Y%m%d") + "T160000"
+              dtend = ev["checkout"].strftime("%Y%m%d") + "T120000"
+              uid = f"{ev['room']}-{ev['checkin']}-{ev['checkout']}@ybertel.github.io"
+              lines.extend([
+                  "BEGIN:VEVENT",
+                  f"DTSTAMP:{now_utc}",
+                  f"UID:{uid}",
+                  f"DTSTART;TZID=Asia/Seoul:{dtstart}",
+                  f"DTEND;TZID=Asia/Seoul:{dtend}",
+                  f"SUMMARY:{ev['summary']}",
+                  "END:VEVENT",
+              ])
+
+          lines.append("END:VCALENDAR")
+
+          docs = Path("docs")
+          docs.mkdir(exist_ok=True)
+          (docs / "combined.ics").write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+          print(f"Wrote {len(all_events)} events to docs/combined.ics")
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/combined.ics
+          git diff --cached --quiet || git commit -m "Update combined ICS"
+          git push
