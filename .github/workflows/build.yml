@@ -32,6 +32,15 @@ jobs:
           BOOKING_302: ${{ secrets.BOOKING_302 }}
           BOOKING_206: ${{ secrets.BOOKING_206 }}
           BOOKING_307: ${{ secrets.BOOKING_307 }}
+          AIRBNB_303: ${{ secrets.AIRBNB_303 }}
+          AIRBNB_305: ${{ secrets.AIRBNB_305 }}
+          AIRBNB_301: ${{ secrets.AIRBNB_301 }}
+          AIRBNB_205: ${{ secrets.AIRBNB_205 }}
+          AIRBNB_203: ${{ secrets.AIRBNB_203 }}
+          AIRBNB_201: ${{ secrets.AIRBNB_201 }}
+          AIRBNB_302: ${{ secrets.AIRBNB_302 }}
+          AIRBNB_206: ${{ secrets.AIRBNB_206 }}
+          AIRBNB_307: ${{ secrets.AIRBNB_307 }}
         run: |
           python - <<'PY'
           import os
@@ -40,16 +49,29 @@ jobs:
           from datetime import datetime
           from pathlib import Path
 
-          ROOM_URLS = {
-              "303": os.environ.get("BOOKING_303", "").strip(),
-              "305": os.environ.get("BOOKING_305", "").strip(),
-              "301": os.environ.get("BOOKING_301", "").strip(),
-              "205": os.environ.get("BOOKING_205", "").strip(),
-              "203": os.environ.get("BOOKING_203", "").strip(),
-              "201": os.environ.get("BOOKING_201", "").strip(),
-              "302": os.environ.get("BOOKING_302", "").strip(),
-              "206": os.environ.get("BOOKING_206", "").strip(),
-              "307": os.environ.get("BOOKING_307", "").strip(),
+          SOURCES = {
+              "B": {
+                  "303": os.environ.get("BOOKING_303", "").strip(),
+                  "305": os.environ.get("BOOKING_305", "").strip(),
+                  "301": os.environ.get("BOOKING_301", "").strip(),
+                  "205": os.environ.get("BOOKING_205", "").strip(),
+                  "203": os.environ.get("BOOKING_203", "").strip(),
+                  "201": os.environ.get("BOOKING_201", "").strip(),
+                  "302": os.environ.get("BOOKING_302", "").strip(),
+                  "206": os.environ.get("BOOKING_206", "").strip(),
+                  "307": os.environ.get("BOOKING_307", "").strip(),
+              },
+              "A": {
+                  "303": os.environ.get("AIRBNB_303", "").strip(),
+                  "305": os.environ.get("AIRBNB_305", "").strip(),
+                  "301": os.environ.get("AIRBNB_301", "").strip(),
+                  "205": os.environ.get("AIRBNB_205", "").strip(),
+                  "203": os.environ.get("AIRBNB_203", "").strip(),
+                  "201": os.environ.get("AIRBNB_201", "").strip(),
+                  "302": os.environ.get("AIRBNB_302", "").strip(),
+                  "206": os.environ.get("AIRBNB_206", "").strip(),
+                  "307": os.environ.get("AIRBNB_307", "").strip(),
+              },
           }
 
           def fetch_text(url: str) -> str:
@@ -63,13 +85,25 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as resp:
                   return resp.read().decode("utf-8", errors="replace")
 
-          def parse_ics_events(text: str):
+          def unfold_ics_lines(text: str) -> str:
               text = text.replace("\r\n", "\n").replace("\r", "\n")
+              lines = text.split("\n")
+              unfolded = []
+              for line in lines:
+                  if line.startswith(" ") or line.startswith("\t"):
+                      if unfolded:
+                          unfolded[-1] += line[1:]
+                  else:
+                      unfolded.append(line)
+              return "\n".join(unfolded)
+
+          def parse_ics_events(text: str):
+              text = unfold_ics_lines(text)
               raw_events = re.findall(r"BEGIN:VEVENT(.*?)END:VEVENT", text, flags=re.S)
               events = []
               for raw in raw_events:
-                  m_start = re.search(r"DTSTART(?:;VALUE=DATE)?:(\d{8})", raw)
-                  m_end = re.search(r"DTEND(?:;VALUE=DATE)?:(\d{8})", raw)
+                  m_start = re.search(r"DTSTART(?:;[^:]+)?:(\d{8})(T\d{6}Z?)?", raw)
+                  m_end = re.search(r"DTEND(?:;[^:]+)?:(\d{8})(T\d{6}Z?)?", raw)
                   if not m_start or not m_end:
                       continue
                   start = datetime.strptime(m_start.group(1), "%Y%m%d").date()
@@ -95,22 +129,24 @@ jobs:
               return f"{d.month}/{d.day}"
 
           all_events = []
-          for room, url in ROOM_URLS.items():
-              if not url:
-                  continue
-              text = fetch_text(url)
-              ranges = parse_ics_events(text)
-              merged = merge_ranges(ranges)
-              for checkin, checkout in merged:
-                  summary = f"B {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
-                  all_events.append({
-                      "room": room,
-                      "checkin": checkin,
-                      "checkout": checkout,
-                      "summary": summary,
-                  })
+          for source, rooms in SOURCES.items():
+              for room, url in rooms.items():
+                  if not url:
+                      continue
+                  text = fetch_text(url)
+                  ranges = parse_ics_events(text)
+                  merged = merge_ranges(ranges)
+                  for checkin, checkout in merged:
+                      summary = f"{source} {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
+                      all_events.append({
+                          "source": source,
+                          "room": room,
+                          "checkin": checkin,
+                          "checkout": checkout,
+                          "summary": summary,
+                      })
 
-          all_events.sort(key=lambda x: (x["checkin"], x["room"]))
+          all_events.sort(key=lambda x: (x["checkin"], x["room"], x["source"]))
 
           now_utc = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
           lines = [
@@ -126,7 +162,7 @@ jobs:
           for ev in all_events:
               dtstart = ev["checkin"].strftime("%Y%m%d") + "T160000"
               dtend = ev["checkout"].strftime("%Y%m%d") + "T120000"
-              uid = f"{ev['room']}-{ev['checkin']}-{ev['checkout']}@ybertel.github.io"
+              uid = f"{ev['source']}-{ev['room']}-{ev['checkin']}-{ev['checkout']}@ybertel.github.io"
               lines.extend([
                   "BEGIN:VEVENT",
                   f"DTSTAMP:{now_utc}",
@@ -149,6 +185,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/combined.ics
+          git diff --cached --quiet || git commit -m "Update combined ICS"
+          git push
           git add docs/combined.ics
           git diff --cached --quiet || git commit -m "Update combined ICS"
           git push
