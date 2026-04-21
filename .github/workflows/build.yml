@@ -21,6 +21,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install icalendar
+
       - name: Build combined ICS
         env:
           BOOKING_303: ${{ secrets.BOOKING_303 }}
@@ -44,10 +49,14 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          import re
+          import sys
+          import uuid
           import urllib.request
-          from datetime import datetime
           from pathlib import Path
+          from datetime import datetime, date
+
+          from icalendar import Calendar
+
 
           SOURCES = {
               "B": {
@@ -74,6 +83,11 @@ jobs:
               },
           }
 
+
+          def log(msg: str):
+              print(msg, flush=True)
+
+
           def fetch_text(url: str) -> str:
               req = urllib.request.Request(
                   url,
@@ -83,111 +97,193 @@ jobs:
                   },
               )
               with urllib.request.urlopen(req, timeout=30) as resp:
-                  return resp.read().decode("utf-8", errors="replace")
+                  charset = resp.headers.get_content_charset() or "utf-8"
+                  return resp.read().decode(charset, errors="replace")
 
-          def unfold_ics_lines(text: str) -> str:
-              text = text.replace("\r\n", "\n").replace("\r", "\n")
-              lines = text.split("\n")
-              unfolded = []
-              for line in lines:
-                  if line.startswith(" ") or line.startswith("\t"):
-                      if unfolded:
-                          unfolded[-1] += line[1:]
-                  else:
-                      unfolded.append(line)
-              return "\n".join(unfolded)
+
+          def normalize_to_date(value):
+              if value is None:
+                  return None
+              if isinstance(value, datetime):
+                  return value.date()
+              if isinstance(value, date):
+                  return value
+              if hasattr(value, "dt"):
+                  return normalize_to_date(value.dt)
+              return None
+
 
           def parse_ics_events(text: str):
-              text = unfold_ics_lines(text)
-              raw_events = re.findall(r"BEGIN:VEVENT(.*?)END:VEVENT", text, flags=re.S)
+              cal = Calendar.from_ical(text)
               events = []
-              for raw in raw_events:
-                  m_start = re.search(r"DTSTART(?:;[^:]+)?:(\d{8})(T\d{6}Z?)?", raw)
-                  m_end = re.search(r"DTEND(?:;[^:]+)?:(\d{8})(T\d{6}Z?)?", raw)
-                  if not m_start or not m_end:
+
+              for component in cal.walk():
+                  if component.name != "VEVENT":
                       continue
-                  start = datetime.strptime(m_start.group(1), "%Y%m%d").date()
-                  end = datetime.strptime(m_end.group(1), "%Y%m%d").date()
-                  if end > start:
-                      events.append((start, end))
+
+                  dtstart = component.get("DTSTART")
+                  dtend = component.get("DTEND")
+
+                  if not dtstart or not dtend:
+                      continue
+
+                  start = normalize_to_date(dtstart.dt)
+                  end = normalize_to_date(dtend.dt)
+
+                  if not start or not end:
+                      continue
+
+                  # 비정상 데이터 제거
+                  stay_days = (end - start).days
+                  if stay_days <= 0:
+                      continue
+
+                  # Airbnb에서 종종 생기는 지나치게 긴 블록 제거
+                  if stay_days > 60:
+                      continue
+
+                  events.append((start, end))
+
               return sorted(events)
+
 
           def merge_ranges(ranges):
               if not ranges:
                   return []
+
               merged = [list(ranges[0])]
               for start, end in ranges[1:]:
                   last_start, last_end = merged[-1]
+
                   if start <= last_end:
                       if end > last_end:
                           merged[-1][1] = end
                   else:
                       merged.append([start, end])
+
               return [(s, e) for s, e in merged]
+
 
           def fmt_md(d):
               return f"{d.month}/{d.day}"
 
+
+          def build_event_uid(source: str, room: str, checkin, checkout):
+              seed = f"{source}-{room}-{checkin.isoformat()}-{checkout.isoformat()}"
+              stable_id = uuid.uuid5(uuid.NAMESPACE_DNS, seed)
+              return f"{stable_id}@ota-combined"
+
+
+          def build_summary(source: str, room: str, checkin, checkout):
+              return f"{source} {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
+
+
+          def write_ics_file(path: Path, cal_name: str, events: list[dict]):
+              now_utc = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+              lines = [
+                  "BEGIN:VCALENDAR",
+                  "VERSION:2.0",
+                  "PRODID:-//ybertel//OTA Combined Calendar//EN",
+                  "CALSCALE:GREGORIAN",
+                  "METHOD:PUBLISH",
+                  f"X-WR-CALNAME:{cal_name}",
+                  "X-WR-TIMEZONE:Asia/Seoul",
+              ]
+
+              for ev in events:
+                  dtstart = ev["checkin"].strftime("%Y%m%d")
+                  dtend = ev["checkout"].strftime("%Y%m%d")
+                  uid = build_event_uid(ev["source"], ev["room"], ev["checkin"], ev["checkout"])
+
+                  lines.extend([
+                      "BEGIN:VEVENT",
+                      f"DTSTAMP:{now_utc}",
+                      f"UID:{uid}",
+                      f"DTSTART;VALUE=DATE:{dtstart}",
+                      f"DTEND;VALUE=DATE:{dtend}",
+                      f"SUMMARY:{ev['summary']}",
+                      "END:VEVENT",
+                  ])
+
+              lines.append("END:VCALENDAR")
+              path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+
+
           all_events = []
+          airbnb_events = []
+          booking_events = []
+
+          total_success_sources = 0
+          total_failed_sources = 0
+
           for source, rooms in SOURCES.items():
               for room, url in rooms.items():
                   if not url:
+                      log(f"[SKIP] {source}-{room}: empty url")
                       continue
-                  text = fetch_text(url)
-                  ranges = parse_ics_events(text)
-                  merged = merge_ranges(ranges)
-                  for checkin, checkout in merged:
-                      summary = f"{source} {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
-                      all_events.append({
-                          "source": source,
-                          "room": room,
-                          "checkin": checkin,
-                          "checkout": checkout,
-                          "summary": summary,
-                      })
+
+                  try:
+                      text = fetch_text(url)
+                      log(f"[FETCH] {source}-{room}: ok, {len(text)} chars")
+
+                      if "BEGIN:VCALENDAR" not in text:
+                          raise ValueError("response is not a valid VCALENDAR payload")
+
+                      ranges = parse_ics_events(text)
+                      log(f"[PARSE] {source}-{room}: {len(ranges)} raw events")
+
+                      merged = merge_ranges(ranges)
+                      log(f"[MERGE] {source}-{room}: {len(merged)} merged events")
+
+                      for checkin, checkout in merged:
+                          event = {
+                              "source": source,
+                              "room": room,
+                              "checkin": checkin,
+                              "checkout": checkout,
+                              "summary": build_summary(source, room, checkin, checkout),
+                          }
+                          all_events.append(event)
+
+                          if source == "A":
+                              airbnb_events.append(event)
+                          elif source == "B":
+                              booking_events.append(event)
+
+                      total_success_sources += 1
+
+                  except Exception as e:
+                      total_failed_sources += 1
+                      log(f"[ERROR] {source}-{room}: {type(e).__name__}: {e}")
 
           all_events.sort(key=lambda x: (x["checkin"], x["room"], x["source"]))
-
-          now_utc = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-          lines = [
-              "BEGIN:VCALENDAR",
-              "VERSION:2.0",
-              "PRODID:-//ybertel//OTA Combined Calendar//EN",
-              "CALSCALE:GREGORIAN",
-              "METHOD:PUBLISH",
-              "X-WR-CALNAME:OTA Combined",
-              "X-WR-TIMEZONE:Asia/Seoul",
-          ]
-
-          for ev in all_events:
-              dtstart = ev["checkin"].strftime("%Y%m%d") + "T160000"
-              dtend = ev["checkout"].strftime("%Y%m%d") + "T120000"
-              uid = f"{ev['source']}-{ev['room']}-{ev['checkin']}-{ev['checkout']}@ybertel.github.io"
-              lines.extend([
-                  "BEGIN:VEVENT",
-                  f"DTSTAMP:{now_utc}",
-                  f"UID:{uid}",
-                  f"DTSTART;TZID=Asia/Seoul:{dtstart}",
-                  f"DTEND;TZID=Asia/Seoul:{dtend}",
-                  f"SUMMARY:{ev['summary']}",
-                  "END:VEVENT",
-              ])
-
-          lines.append("END:VCALENDAR")
+          airbnb_events.sort(key=lambda x: (x["checkin"], x["room"]))
+          booking_events.sort(key=lambda x: (x["checkin"], x["room"]))
 
           docs = Path("docs")
           docs.mkdir(exist_ok=True)
-          (docs / "combined.ics").write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-          print(f"Wrote {len(all_events)} events to docs/combined.ics")
+
+          write_ics_file(docs / "combined.ics", "OTA Combined", all_events)
+          write_ics_file(docs / "airbnb.ics", "OTA Airbnb", airbnb_events)
+          write_ics_file(docs / "booking.ics", "OTA Booking", booking_events)
+
+          log("=" * 60)
+          log(f"SUCCESS SOURCES: {total_success_sources}")
+          log(f"FAILED SOURCES : {total_failed_sources}")
+          log(f"TOTAL EVENTS   : {len(all_events)}")
+          log(f"AIRBNB EVENTS  : {len(airbnb_events)}")
+          log(f"BOOKING EVENTS : {len(booking_events)}")
+          log("OUTPUT         : docs/combined.ics, docs/airbnb.ics, docs/booking.ics")
+
+          if len(all_events) == 0:
+              log("[FATAL] No events generated. Check secrets or ICS parsing.")
+              sys.exit(1)
           PY
 
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/combined.ics
-          git diff --cached --quiet || git commit -m "Update combined ICS"
-          git push
-          git add docs/combined.ics
+          git add docs/combined.ics docs/airbnb.ics docs/booking.ics
           git diff --cached --quiet || git commit -m "Update combined ICS"
           git push
