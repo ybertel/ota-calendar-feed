@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install icalendar
 
-      - name: Build combined ICS
+      - name: Build OTA ICS files
         env:
           BOOKING_303: ${{ secrets.BOOKING_303 }}
           BOOKING_305: ${{ secrets.BOOKING_305 }}
@@ -133,12 +133,11 @@ jobs:
                   if not start or not end:
                       continue
 
-                  # 비정상 데이터 제거
                   stay_days = (end - start).days
                   if stay_days <= 0:
                       continue
 
-                  # Airbnb에서 종종 생기는 지나치게 긴 블록 제거
+                  # 비정상 장기 블록 제거
                   if stay_days > 60:
                       continue
 
@@ -168,14 +167,14 @@ jobs:
               return f"{d.month}/{d.day}"
 
 
+          def build_summary(source: str, room: str, checkin, checkout):
+              return f"{source} {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
+
+
           def build_event_uid(source: str, room: str, checkin, checkout):
               seed = f"{source}-{room}-{checkin.isoformat()}-{checkout.isoformat()}"
               stable_id = uuid.uuid5(uuid.NAMESPACE_DNS, seed)
               return f"{stable_id}@ota-combined"
-
-
-          def build_summary(source: str, room: str, checkin, checkout):
-              return f"{source} {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
 
 
           def write_ics_file(path: Path, cal_name: str, events: list[dict]):
@@ -285,5 +284,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/combined.ics docs/airbnb.ics docs/booking.ics
-          git diff --cached --quiet || git commit -m "Update combined ICS"
+          git diff --cached --quiet || git commit -m "Update OTA ICS files"
           git push
