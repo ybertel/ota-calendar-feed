@@ -113,12 +113,35 @@ jobs:
               return None
 
 
+          def text_contains_cancel_words(*parts):
+              text = " ".join([str(p or "") for p in parts]).lower()
+              keywords = [
+                  "cancel",
+                  "cancelled",
+                  "canceled",
+                  "reservation canceled",
+                  "reservation cancelled",
+              ]
+              return any(k in text for k in keywords)
+
+
           def parse_ics_events(text: str):
               cal = Calendar.from_ical(text)
               events = []
 
               for component in cal.walk():
                   if component.name != "VEVENT":
+                      continue
+
+                  status = str(component.get("STATUS", "")).upper()
+                  summary = str(component.get("SUMMARY", ""))
+                  description = str(component.get("DESCRIPTION", ""))
+
+                  # 취소 이벤트 제거
+                  if status == "CANCELLED":
+                      continue
+
+                  if text_contains_cancel_words(summary, description):
                       continue
 
                   dtstart = component.get("DTSTART")
@@ -154,6 +177,7 @@ jobs:
               for start, end in ranges[1:]:
                   last_start, last_end = merged[-1]
 
+                  # 겹치거나 이어지면 하나로 합침
                   if start <= last_end:
                       if end > last_end:
                           merged[-1][1] = end
@@ -169,6 +193,10 @@ jobs:
 
           def build_summary(source: str, room: str, checkin, checkout):
               return f"{source} {room} {fmt_md(checkin)}~{fmt_md(checkout)}"
+
+
+          def build_combined_summary(room: str, checkin, checkout):
+              return f"{room} {fmt_md(checkin)}~{fmt_md(checkout)}"
 
 
           def build_event_uid(source: str, room: str, checkin, checkout):
@@ -206,6 +234,32 @@ jobs:
 
               lines.append("END:VCALENDAR")
               path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+
+
+          def build_combined_events(events: list[dict]):
+              grouped = {}
+
+              for ev in events:
+                  room = ev["room"]
+                  grouped.setdefault(room, []).append((ev["checkin"], ev["checkout"]))
+
+              combined_events = []
+
+              for room, ranges in grouped.items():
+                  ranges.sort()
+                  merged = merge_ranges(ranges)
+
+                  for checkin, checkout in merged:
+                      combined_events.append({
+                          "source": "C",
+                          "room": room,
+                          "checkin": checkin,
+                          "checkout": checkout,
+                          "summary": build_combined_summary(room, checkin, checkout),
+                      })
+
+              combined_events.sort(key=lambda x: (x["checkin"], x["room"]))
+              return combined_events
 
 
           all_events = []
@@ -255,27 +309,27 @@ jobs:
                       total_failed_sources += 1
                       log(f"[ERROR] {source}-{room}: {type(e).__name__}: {e}")
 
-          all_events.sort(key=lambda x: (x["checkin"], x["room"], x["source"]))
           airbnb_events.sort(key=lambda x: (x["checkin"], x["room"]))
           booking_events.sort(key=lambda x: (x["checkin"], x["room"]))
+          combined_events = build_combined_events(all_events)
 
           docs = Path("docs")
           docs.mkdir(exist_ok=True)
 
-          write_ics_file(docs / "combined.ics", "OTA Combined", all_events)
+          write_ics_file(docs / "combined.ics", "OTA Combined", combined_events)
           write_ics_file(docs / "airbnb.ics", "OTA Airbnb", airbnb_events)
           write_ics_file(docs / "booking.ics", "OTA Booking", booking_events)
 
           log("=" * 60)
           log(f"SUCCESS SOURCES: {total_success_sources}")
           log(f"FAILED SOURCES : {total_failed_sources}")
-          log(f"TOTAL EVENTS   : {len(all_events)}")
+          log(f"COMBINED EVENTS: {len(combined_events)}")
           log(f"AIRBNB EVENTS  : {len(airbnb_events)}")
           log(f"BOOKING EVENTS : {len(booking_events)}")
           log("OUTPUT         : docs/combined.ics, docs/airbnb.ics, docs/booking.ics")
 
-          if len(all_events) == 0:
-              log("[FATAL] No events generated. Check secrets or ICS parsing.")
+          if len(combined_events) == 0:
+              log("[FATAL] No combined events generated. Check secrets or ICS parsing.")
               sys.exit(1)
           PY
 
